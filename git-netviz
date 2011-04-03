@@ -1,0 +1,197 @@
+#!/usr/bin/env python
+
+"""\
+Given a list of Git repositories, attempt to graph the commit history to discover related repositories.
+"""
+
+
+from collections import namedtuple, defaultdict
+from functools import partial
+from itertools import imap
+from subprocess import *
+
+
+CommitId = partial(int, base=16)
+
+
+class Repository(object):
+
+    @staticmethod
+    def is_git_dir(path):
+        try:
+            output = check_output(['git', 'rev-parse', '--is-inside-git-dir'], 
+                                  cwd=path)
+        except CalledProcessError:
+            return False
+        else:
+            return output.strip().lower() == 'true'
+
+    @classmethod
+    def open(cls, path):
+        if not cls.is_git_dir(path):
+            raise ValueError("Not a git repository: %r" % path)
+        return cls(path)
+
+    def __init__(self, path):
+        self.path = path
+
+    def __str__(self):
+        return str(self.path)
+
+    @property
+    def refs(self):
+        """Calls 'git show-ref' to get a list of references.
+
+        Yields 2-tuple (commit_id, ref_name).
+        """
+        p = Popen(['git', 'show-ref', '--no-head'], cwd=self.path, stdout=PIPE)
+        for line in p.stdout:
+            commit_id, refname = line.split()
+            yield (CommitId(commit_id), refname)            
+
+    @property
+    def commits(self):
+        """Calls 'git rev-list' to get a list of commit IDs.
+
+        Yields 3-tuple (timestamp, commit_id, [parents]).
+        """
+        p = Popen(['git', 'rev-list', '--all', '--timestamp', '--parents'], 
+                  cwd=self.path, stdout=PIPE)
+        for line in p.stdout:
+            commit_info = line.split()
+            if len(commit_info) < 2:
+                print >> sys.stderr, "error: bad line: %r" % line
+                continue
+            timestamp = int(commit_info.pop(0))
+            commit_info = map(CommitId, commit_info)
+            commit_id = commit_info.pop(0)
+            yield (timestamp, commit_id, commit_info)
+
+
+class NodeEdges(namedtuple('NodeEdges', ('incoming', 'outgoing'))):
+    __slots__ = ()
+    def __new__(cls, incoming=None, outgoing=None):
+        if incoming is None:
+            incoming = set()
+        if outgoing is None:
+            outgoing = set()
+        return super(NodeEdges, cls).__new__(cls, incoming, outgoing)
+
+
+class CommitGraph(object):
+    
+    def __init__(self):
+        self.V = defaultdict(NodeEdges)
+        self.E = {}
+        self.refs = defaultdict(list)
+
+    def load_repo(self, repo):
+        # load references
+        for commit_id, refname in repo.refs:
+            if refname.startswith('refs/remote'):
+                continue
+            ref = "%s:%s" % (repo, refname)
+            self.refs[commit_id].append(ref)
+        # load commits
+        for timestamp, commit_id, parents in repo.commits:
+            # have to guarantee that node for commit_id exists
+            if commit_id not in self.V:
+                self.V[commit_id] = NodeEdges()
+            # add edges
+            for parent_id in parents:
+                self.E[(parent_id, commit_id)] = 0
+                self.V[parent_id].outgoing.add(commit_id)
+                self.V[commit_id].incoming.add(parent_id)
+
+    def compact(self):
+        compacted_nodes = set()
+        for node, edges in self.V.iteritems():
+            # do not compact nodes that have refs
+            if node in self.refs:
+                continue
+            # only compact nodes with exactly one incoming AND outgoing edge
+            if not (len(edges.incoming) == len(edges.outgoing) == 1):
+                continue
+            # ok to compact node that looks like:
+            #     parent -> node -> child
+            parent, = edges.incoming
+            child, = edges.outgoing
+            # TODO: remove cycles if weight == 0
+            if node == parent or node == child:
+                continue
+            # update
+            self.V[parent].outgoing.remove(node)
+            self.V[child].incoming.remove(node)
+            self.V[parent].outgoing.add(child)
+            self.V[child].incoming.add(parent)
+            # update edges and weights
+            # (parent, child) may be existing edge
+            self.E[(parent, child)] = self.E[(parent, node)] + \
+                                      self.E[(node, child)] + \
+                                      1 + \
+                                      self.E.get((parent, child), 0)
+            del self.E[(parent, node)]
+            del self.E[(node, child)]
+            compacted_nodes.add(node)
+        for node in compacted_nodes:
+            del self.V[node]
+        # We have to loop over the nodes at least twice, because we could
+        # end up compacting the graph to the point that two branches are
+        # compacted to the same artifical edge after the parent node has
+        # already been traversed.
+        if compacted_nodes:
+            self.compact()
+
+    def __str__(self):
+        # TODO: fast-forwardable artifical edges should be solid
+        # TODO: non-fast forwardable artifical edges should be dashed
+        lines = ["digraph G {", "graph [rankdir=TB];"]
+        for (u, v), weight in self.E.iteritems():
+            opts = {}
+            if weight > 0:
+                opts['style'] = 'dashed'
+            if weight > 1:
+                opts['label'] = str(weight)
+            opts = ' [%s]' % ','.join('%s="%s"' % (k, v) 
+                                      for k, v in opts.iteritems())
+            lines.append('"%s" -> "%s"%s;' % (u, v, opts))
+        for node in self.V:
+            opts = {}
+            if node in self.refs:
+                opts['label'] = '\\n'.join(self.refs[node])
+                opts['shape'] = 'box'
+                opts['style'] = 'rounded,bold'
+                #opts['style'] = 'rounded,bold,filled'
+                #opts['color'] = 'cornflowerblue'
+                #opts['fillcolor'] = 'lightblue'
+            else:
+                opts['label'] = ("%x" % node)[:7]
+            opts = ' [%s]' % ','.join('%s="%s"' % (k, v) 
+                                      for k, v in opts.iteritems())
+            lines.append('"%s"%s;' % (node, opts))
+        lines.append("}")
+        return '\n'.join(lines)
+
+
+if __name__ == "__main__":
+    from optparse import OptionParser
+    import sys
+
+    parser = OptionParser(usage="usage: %prog [repo ...]")
+    options, args = parser.parse_args()
+
+    if not args:
+        def _read_args():
+            for line in sys.stdin:
+                yield line.rstrip()
+        args = _read_args()
+
+    G = CommitGraph()
+    for path in args:
+        try:
+            repo = Repository.open(path)
+        except ValueError as e:
+            print >> sys.stderr, "error:", e
+        G.load_repo(repo)
+    G.compact()
+    print G
